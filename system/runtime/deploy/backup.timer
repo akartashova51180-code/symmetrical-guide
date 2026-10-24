@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily encrypted backup of Anastasia Brain
+
+[Timer]
+OnCalendar=*-*-* 03:15:00
+Persistent=true
+RandomizedDelaySec=30m
+Unit=backup-anastasia-brain.service
+
+[Install]
+WantedBy=timers.target

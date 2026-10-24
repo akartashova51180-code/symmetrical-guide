@@ -1,0 +1,14 @@
+# Local secrets and runtime state
+.env
+**/.env
+**/__pycache__/
+*.py[cod]
+.venv/
+**/.venv/
+system/runtime/data/
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+*.dump
+*.dump.age
+*.tar.gz

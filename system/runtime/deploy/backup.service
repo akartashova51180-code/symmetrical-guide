@@ -1,0 +1,10 @@
+[Unit]
+Description=Encrypted backup of Anastasia Brain PostgreSQL and media
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=root
+EnvironmentFile=/etc/anastasia-brain-backup.env
+ExecStart=/usr/local/sbin/backup-anastasia-brain

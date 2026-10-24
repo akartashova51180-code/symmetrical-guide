@@ -1,0 +1,19 @@
+[project]
+name = "anastasia-corporate-brain"
+version = "0.1.0"
+description = "Локальный сервис портфеля, сроков и ежедневных сводок"
+requires-python = ">=3.12"
+dependencies = [
+  "apscheduler>=3.10,<4",
+  "fastapi>=0.115,<1",
+  "psycopg[binary]>=3.2,<4",
+  "python-multipart>=0.0.9,<1",
+  "uvicorn>=0.30,<1",
+]
+
+[project.optional-dependencies]
+test = ["httpx>=0.27,<1", "pytest>=8,<9"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

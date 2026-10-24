@@ -1,0 +1,2 @@
+scan_id,checked_at,geography,buyer_segment,demand_situation,query_or_signal,source_type,source_url,source_date,source_text_or_summary,evidence_level,commercial_readiness,possible_offer,channel_to_reach,budget_or_procurement_signal,next_action,result,status,limitations
+SCAN-001,,Московская область,Организаторы корпоративных мероприятий,Мероприятие требует оригинального музыкального номера,,,,,,Гипотеза,Не проверено,Песня под мероприятие / гимн / музыкальный ролик,,,,,Проверить,Не считать спрос подтверждённым без запроса/брифа/закупки
