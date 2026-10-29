@@ -1,0 +1,47 @@
+services:
+  app:
+    build:
+      context: ../../..
+      dockerfile: system/runtime/Dockerfile
+    restart: unless-stopped
+    environment:
+      CORPORATE_BRAIN_DATABASE_URL: ${CORPORATE_BRAIN_DATABASE_URL:?Set CORPORATE_BRAIN_DATABASE_URL in .env}
+      CORPORATE_BRAIN_DATA_DIR: /data
+      CORPORATE_BRAIN_SOURCE_DIR: /app/system
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_ALLOWED_USER_IDS: ${TELEGRAM_ALLOWED_USER_IDS:-}
+      TELEGRAM_NOTIFY_CHAT_ID: ${TELEGRAM_NOTIFY_CHAT_ID:-}
+    volumes:
+      - ${DATA_ROOT:-/srv/anastasia-brain/data}:/data
+    ports:
+      - "127.0.0.1:8787:8787"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks: [brain-net]
+
+  telegram-bot:
+    build:
+      context: ../../..
+      dockerfile: system/runtime/Dockerfile
+    command: ["python", "-m", "corporate_brain.telegram_intake"]
+    restart: unless-stopped
+    environment:
+      CORPORATE_BRAIN_DATABASE_URL: ${CORPORATE_BRAIN_DATABASE_URL:?Set CORPORATE_BRAIN_DATABASE_URL in .env}
+      CORPORATE_BRAIN_DATA_DIR: /data
+      CORPORATE_BRAIN_API: http://app:8787
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?Set TELEGRAM_BOT_TOKEN in .env}
+      TELEGRAM_ALLOWED_USER_IDS: ${TELEGRAM_ALLOWED_USER_IDS:?Set TELEGRAM_ALLOWED_USER_IDS in .env}
+    volumes:
+      - ${DATA_ROOT:-/srv/anastasia-brain/data}:/data
+    depends_on:
+      app:
+        condition: service_healthy
+    networks: [brain-net]
+
+networks:
+  brain-net:
+    driver: bridge
