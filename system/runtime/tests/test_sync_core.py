@@ -46,3 +46,27 @@ def test_invalid_event_is_rejected(tmp_path, field, value):
     with pytest.raises(ValueError):
         journal.put(payload)
 
+
+def test_invalid_destination_does_not_write_partial_event(tmp_path):
+    journal = EventJournal(tmp_path / "sync.sqlite3")
+    with pytest.raises(ValueError, match="unknown destination"):
+        journal.put(event(), destinations=("codex", "untrusted"))
+    assert journal.versions("SYNC-TEST-20261119-01") == []
+    assert journal.put(event())["status"] == "accepted"
+
+
+def test_duplicate_ack_does_not_increment_attempts(tmp_path):
+    import sqlite3
+    db_path = tmp_path / "sync.sqlite3"
+    journal = EventJournal(db_path)
+    journal.put(event())
+    assert journal.ack("SYNC-TEST-20261119-01", 1, "codex")
+    assert journal.ack("SYNC-TEST-20261119-01", 1, "codex")
+    with sqlite3.connect(db_path) as db:
+        attempts = db.execute(
+            "SELECT attempts FROM sync_deliveries WHERE event_id=? AND version=? AND destination=?",
+            ("SYNC-TEST-20261119-01", 1, "codex")
+        ).fetchone()[0]
+    assert attempts == 1
+    with pytest.raises(ValueError, match="cannot change delivered"):
+        journal.ack("SYNC-TEST-20261119-01", 1, "codex", "failed")
