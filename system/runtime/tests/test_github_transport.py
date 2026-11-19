@@ -33,7 +33,7 @@ class MockGitHub:
         self.requests.append((method, path))
         if method == "GET":
             assert path.startswith("issues/42/comments?per_page=100&page=")
-            page = int(path.split("page=")[1])
+            page = int(path.rsplit("&page=", 1)[1])
             return [{"body": text} for text in self.comments[(page-1)*100:page*100]]
         if method == "POST":
             assert path == "issues/42/comments"
