@@ -1,6 +1,6 @@
 from corporate_brain.sync_worker import deliver_pending_supabase
 from sync_core import EventJournal
-from supabase_transport import SupabaseDeliveryError
+from corporate_brain.supabase_transport import SupabaseDeliveryError
 
 
 def event():
