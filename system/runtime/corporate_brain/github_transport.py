@@ -6,6 +6,7 @@ event. It never claims that Codex executed or even read the issue.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -26,22 +27,30 @@ class GitHubDeliveryError(RuntimeError):
     pass
 
 
-def marker_for(event: dict[str, Any]) -> str:
-    """Stable, unambiguous marker (no private event text is emitted)."""
+def marker_for(event: dict[str, Any], receipt_secret: str) -> str:
+    """Keyed, stable marker that cannot be predicted from public issue data."""
     e = canonical_event(event)
     seed = json.dumps([e["event_id"], e["version"]], separators=(",", ":"))
-    digest = hashlib.sha256(seed.encode()).hexdigest()[:32]
+    if not isinstance(receipt_secret, str) or len(receipt_secret) < 16:
+        raise ValueError("separate receipt signing secret required")
+    digest = hmac.new(receipt_secret.encode(), seed.encode(), hashlib.sha256).hexdigest()[:32]
     return "<!-- corporate-brain-gateway-ack:" + digest + " -->"
 
 
 class GitHubIssueTransport:
-    def __init__(self, repo: str, token: str,
+    def __init__(self, repo: str, token: str, receipt_secret: str, receipt_actor: str,
                  request: Callable[[str, str, Any], Any] | None = None):
         if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo or ""):
             raise ValueError("explicit owner/repository required")
         if not token or len(token) < 10:
             raise ValueError("server-only GitHub token required")
+        if not receipt_secret or len(receipt_secret) < 16:
+            raise ValueError("receipt signing secret must be configured")
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", receipt_actor or ""):
+            raise ValueError("trusted receipt actor required")
         self.repo = repo
+        self._receipt_secret = receipt_secret
+        self._receipt_actor = receipt_actor
         self._token = token
         self._request_override = request
 
@@ -91,7 +100,10 @@ class GitHubIssueTransport:
                 "GET", f"issues/{issue_num}/comments?per_page=100&page={page}")
             if not isinstance(comments, list):
                 raise GitHubDeliveryError("invalid GitHub comments response")
-            if any(isinstance(x, dict) and marker in str(x.get("body", "")) for x in comments):
+            if any(isinstance(x, dict)
+                   and isinstance(x.get("user"), dict)
+                   and x["user"].get("login") == self._receipt_actor
+                   and marker in str(x.get("body", "")) for x in comments):
                 return True
             if len(comments) < 100:
                 return False
@@ -100,7 +112,7 @@ class GitHubIssueTransport:
     def deliver(self, event: dict[str, Any]) -> str:
         """One safe test-only acknowledgment, then read back the actual comment."""
         issue_num = self._issue_number(event)
-        marker = marker_for(event)
+        marker = marker_for(event, self._receipt_secret)
         if self._existing(issue_num, marker):
             return "duplicate"
         message = (marker + "\n"
@@ -119,5 +131,7 @@ def from_environment(request: Callable | None = None) -> GitHubIssueTransport:
     return GitHubIssueTransport(
         os.environ.get("CORPORATE_BRAIN_GITHUB_REPO", ""),
         os.environ.get("CORPORATE_BRAIN_GITHUB_TOKEN", ""),
+        os.environ.get("CORPORATE_BRAIN_GITHUB_RECEIPT_SECRET", ""),
+        os.environ.get("CORPORATE_BRAIN_GITHUB_RECEIPT_ACTOR", ""),
         request=request,
     )
