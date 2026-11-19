@@ -36,7 +36,7 @@ uv run --locked uvicorn corporate_brain.app:app --host 127.0.0.1 --port 8787
 - `GET /api/sync/pending/{destination}` — получить ожидающие события (`github`, `supabase`, `codex`, `chatgpt`).
 - `POST /api/sync/events/{event_id}/{version}/ack/{destination}` — подтвердить доставку JSON `{"status":"delivered"}`; при ошибке `{"status":"failed","error":"..."}`.
 - `GET /api/sync/events/{event_id}/versions` — список версий и хешей.
-- `POST /api/sync/github-webhook` — проверка HMAC SHA-256 подписи webhook. Webhook является сигналом, он не превращает произвольное тело GitHub в утверждённое событие.
+- `POST /api/sync/github-webhook` — проверка HMAC SHA-256 подписи webhook. Webhook принимает только явно размеченные синтетические тестовые события из доверенного репозитория и от разрешённого автора (см. ниже). Другие события игнорируются; webhook не утверждает бизнес-решения.
 
 Пример тела события Issue #2 (тестовые публичные данные):
 
@@ -46,7 +46,26 @@ uv run --locked uvicorn corporate_brain.app:app --host 127.0.0.1 --port 8787
 
 ## Supabase и GitHub
 
-Чтобы хранить журнал в Supabase, сначала создайте отдельный тестовый проект и вручную примените подготовленный SQL, затем добавьте отдельный адаптер с service-role ключом в серверном окружении и проверкой хеша/version conflict. Такая интеграция здесь намеренно не включена: применение миграции или запись в основную базу не выполнялись. Для GitHub настройте webhook только на тестовый репозиторий и ограниченный набор событий; сам callback пока лишь проверяет подпись и отвечает, не импортируя тела Issue.
+Чтобы хранить журнал в Supabase, сначала создайте отдельный тестовый проект и вручную примените подготовленный SQL, затем добавьте отдельный адаптер с service-role ключом в серверном окружении и проверкой хеша/version conflict. Такая интеграция здесь намеренно не включена: применение миграции или запись в основную базу не выполнялись. Для GitHub добавлен только opt-in приём синтетических событий; настройку webhook и доступ из интернета пока не выполнять. Для локального теста требуются переменные CORPORATE_BRAIN_GITHUB_REPO и CORPORATE_BRAIN_GITHUB_ACTORS. Входящий обработчик проверяет подпись GitHub, repo/sender/author и принимает один структурированный блок sync-event. Неизвестные или обычные Issue игнорируются.
 
 Автоматической сквозной синхронизации пока нет: понадобится адаптер GitHub для получения/публикации структурированного события и комментария ACK, Supabase transport и способ вызова API из конкретных чатов ChatGPT и Codex. Проверка через доступ к GitHub или комментарий Issue доказывает только факт чтения/записи там, но не межчатовую доставку.
 
+
+## Безопасный вход GitHub Issues (только тестовые события)
+
+**По умолчанию выключен**: если не настроены `CORPORATE_BRAIN_GITHUB_REPO` и `CORPORATE_BRAIN_GITHUB_ACTORS`, webhook не создаёт событий. Для изолированной локальной проверки (НЕ открывать порт наружу):
+
+```text
+CORPORATE_BRAIN_GITHUB_REPO=akartashova51180-code/symmetrical-guide
+CORPORATE_BRAIN_GITHUB_ACTORS=akartashova51180-code
+```
+
+Обработчик принимает только события `issues` с действием `opened` или `edited`, с проверенной HMAC-подписью, указанным репозиторием, доверенным отправителем и доверенным автором Issue. В тексте Issue должен быть **ровно один** блок:
+
+```sync-event
+{"event_id":"SYNC-TEST-EXAMPLE-01","project_id":"P00","source":"GitHub","source_ref":"https://github.com/akartashova51180-code/symmetrical-guide/issues/9","created_at":"2026-11-19T20:03:58Z","version":1,"type":"test_task","approval":"yes, test only","privacy":"public_synthetic","text":"Synthetic transport check"}
+```
+
+`source_ref` обязан совпадать с реальным URL Issue из подписанного GitHub payload. Реальные решения, резюме, договоры и другие закрытые данные таким путём не принимаются. `ACK` всё ещё является отметкой клиента, а не криптографическим доказательством получения: до отдельного адаптера и фактического подтверждения автоматическая доставка в Codex или ChatGPT **не работает**.
+
+GitHub Actions проверяет алгоритмы при коммитах в разработческую ветку. Для тестов не нужны ключи Supabase, GitHub или сервер Timeweb.
