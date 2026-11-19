@@ -12,7 +12,10 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 
-from .sync_core import canonical_event
+try:
+    from .sync_core import canonical_event
+except ImportError:  # standalone pytest invocation
+    from sync_core import canonical_event
 
 EXPECTED_TABLES = ("sync_events", "sync_deliveries")
 
