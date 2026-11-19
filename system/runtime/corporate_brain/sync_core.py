@@ -101,7 +101,7 @@ class EventJournal:
     def pending(self, destination: str, limit: int = 100) -> list[dict[str, Any]]:
         with self._db() as db:
             rows = db.execute("""SELECT e.payload,d.attempts FROM sync_events e JOIN sync_deliveries d
-                USING(event_id,version) WHERE d.destination=? AND d.status='pending'
+                USING(event_id,version) WHERE d.destination=? AND d.status IN ('pending','failed')
                 ORDER BY e.received_at LIMIT ?""", (destination, max(1, min(limit, 500)))).fetchall()
         return [{"event": json.loads(row["payload"]), "attempts": row["attempts"]} for row in rows]
 
