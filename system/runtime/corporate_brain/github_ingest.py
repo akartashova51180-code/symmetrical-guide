@@ -5,7 +5,10 @@ import json
 import re
 from typing import Any
 
-from sync_core import canonical_event
+try:
+    from .sync_core import canonical_event
+except ImportError:  # standalone pytest invocation
+    from sync_core import canonical_event
 
 FENCE = re.compile(r"```sync-event\s*\n(.*?)\n```", re.DOTALL)
 MAX_BODY = 32768
