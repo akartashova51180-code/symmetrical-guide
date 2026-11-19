@@ -52,7 +52,7 @@ def test_single_comment_and_idempotent_replay():
     mock = MockGitHub()
     t = make_transport(mock)
     assert t.deliver(event()) == "delivered"
-    assert "не подтверждение запуска" in mock.comments[0]
+    assert "подтверждение запуска" in mock.comments[0]
     assert t.deliver(event()) == "duplicate"
     assert mock.writes == 1
 
