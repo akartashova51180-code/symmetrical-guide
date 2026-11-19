@@ -34,7 +34,7 @@ class MockGitHub:
         if method == "GET":
             assert path.startswith("issues/42/comments?per_page=100&page=")
             page = int(path.rsplit("&page=", 1)[1])
-            return [{"body": text} for text in self.comments[(page-1)*100:page*100]]
+            return [{"body": text, "user": {"login": "trusted-gateway"}} for text in self.comments[(page-1)*100:page*100]]
         if method == "POST":
             assert path == "issues/42/comments"
             self.writes += 1
@@ -45,7 +45,8 @@ class MockGitHub:
 
 def make_transport(mock):
     return GitHubIssueTransport("akartashova51180-code/symmetrical-guide",
-                                "fake-ci-test-token", request=mock)
+                                "fake-ci-test-token", "fake-test-receipt-secret-12345",
+                                "trusted-gateway", request=mock)
 
 
 def test_single_comment_and_idempotent_replay():
@@ -59,7 +60,7 @@ def test_single_comment_and_idempotent_replay():
 
 def test_comment_pagination_finds_existing_marker_on_second_page():
     mock = MockGitHub()
-    mock.comments = ["other"]*100 + [marker_for(event())]
+    mock.comments = ["other"]*100 + [marker_for(event(), "fake-test-receipt-secret-12345")]
     assert make_transport(mock).deliver(event()) == "duplicate"
     assert mock.writes == 0
 
@@ -93,5 +94,30 @@ def test_disabled_by_default(monkeypatch):
     monkeypatch.delenv("CORPORATE_BRAIN_GITHUB_OUTBOUND_ENABLED", raising=False)
     monkeypatch.setenv("CORPORATE_BRAIN_GITHUB_REPO", "akartashova51180-code/symmetrical-guide")
     monkeypatch.setenv("CORPORATE_BRAIN_GITHUB_TOKEN", "fake-ci-test-token")
+    monkeypatch.setenv("CORPORATE_BRAIN_GITHUB_RECEIPT_SECRET", "fake-test-receipt-secret-12345")
+    monkeypatch.setenv("CORPORATE_BRAIN_GITHUB_RECEIPT_ACTOR", "trusted-gateway")
     with pytest.raises(RuntimeError, match="disabled"):
         from_environment(request=MockGitHub())
+
+
+
+def test_receipt_from_untrusted_commenter_is_ignored():
+    mock = MockGitHub()
+    marker = marker_for(event(), "fake-test-receipt-secret-12345")
+    mock.comments = [marker]
+    def malicious_then_post(method, path, body):
+        if method == "GET":
+            if mock.writes == 0:
+                return [{"body": marker, "user": {"login": "untrusted"}}]
+            return [{"body": marker, "user": {"login": "trusted-gateway"}}]
+        return mock(method, path, body)
+    transport = GitHubIssueTransport("akartashova51180-code/symmetrical-guide",
+                                    "fake-ci-test-token", "fake-test-receipt-secret-12345",
+                                    "trusted-gateway", request=malicious_then_post)
+    assert transport.deliver(event()) == "delivered"
+    assert mock.writes == 1
+
+
+def test_receipt_marker_changes_with_signing_secret():
+    assert marker_for(event(), "fake-test-receipt-secret-12345") != marker_for(
+        event(), "another-test-secret-key-12345")
