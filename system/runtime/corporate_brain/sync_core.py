@@ -75,6 +75,9 @@ class EventJournal:
 
     def put(self, raw: dict[str, Any], destinations: tuple[str, ...] = ("github", "supabase", "codex")) -> dict[str, Any]:
         event = canonical_event(raw)
+        allowed_destinations = {"github", "supabase", "codex", "chatgpt"}
+        if not all(destination in allowed_destinations for destination in destinations):
+            raise ValueError("unknown destination")
         payload = json.dumps(event, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         digest = hashlib.sha256(payload.encode()).hexdigest()
         with self._db() as db:
@@ -92,8 +95,6 @@ class EventJournal:
             db.execute("INSERT INTO sync_events VALUES(?,?,?,?,?,?)",
                        (event["event_id"], event["version"], payload, digest, event["created_at"], utc_now()))
             for destination in sorted(set(destinations)):
-                if destination not in {"github", "supabase", "codex", "chatgpt"}:
-                    raise ValueError("unknown destination")
                 db.execute("INSERT INTO sync_deliveries(event_id,version,destination) VALUES(?,?,?)",
                            (event["event_id"], event["version"], destination))
         return {"status": "accepted", "event_id": event["event_id"], "version": event["version"], "sha256": digest}
@@ -109,10 +110,19 @@ class EventJournal:
         if destination not in {"github", "supabase", "codex", "chatgpt"} or status not in {"delivered", "failed"}:
             raise ValueError("invalid destination or status")
         with self._db() as db:
-            result = db.execute("""UPDATE sync_deliveries SET status=?, attempts=attempts+1,
+            prior = db.execute("""SELECT status FROM sync_deliveries
+                WHERE event_id=? AND version=? AND destination=?""",
+                (event_id, version, destination)).fetchone()
+            if prior is None:
+                return False
+            if prior["status"] == "delivered":
+                if status == "delivered":
+                    return True  # Duplicate ACK is idempotent.
+                raise ValueError("cannot change delivered status to failed")
+            db.execute("""UPDATE sync_deliveries SET status=?, attempts=attempts+1,
                 ack_at=?, last_error=? WHERE event_id=? AND version=? AND destination=?""",
                 (status, utc_now() if status == "delivered" else None, error[:500], event_id, version, destination))
-            return result.rowcount == 1
+            return True
 
     def versions(self, event_id: str) -> list[dict[str, Any]]:
         with self._db() as db:
