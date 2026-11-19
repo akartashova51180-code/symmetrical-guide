@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hmac
+import json
 import os
 from pathlib import Path
 from typing import Any
@@ -10,8 +11,10 @@ from fastapi import APIRouter, Header, HTTPException, Request
 
 try:
     from .sync_core import EventJournal
+    from .github_ingest import parse_issue_event
 except ImportError:  # standalone tests/import from the module directory
     from sync_core import EventJournal
+    from github_ingest import parse_issue_event
 
 router = APIRouter(prefix="/api/sync", tags=["sync"])
 DB_PATH = Path(os.environ.get("CORPORATE_BRAIN_SYNC_DB", "data/sync-journal.sqlite3"))
@@ -61,7 +64,8 @@ def versions(event_id: str, authorization: str | None = Header(default=None)):
 
 
 @router.post("/github-webhook")
-async def github_webhook(request: Request, x_hub_signature_256: str | None = Header(default=None)):
+async def github_webhook(request: Request, x_hub_signature_256: str | None = Header(default=None),
+                         x_github_event: str | None = Header(default=None)):
     secret = os.environ.get("CORPORATE_BRAIN_GITHUB_WEBHOOK_SECRET", "")
     if not secret or not x_hub_signature_256:
         raise HTTPException(401, "webhook authentication is not configured")
@@ -69,7 +73,24 @@ async def github_webhook(request: Request, x_hub_signature_256: str | None = Hea
     expected = "sha256=" + hmac.new(secret.encode(), raw, "sha256").hexdigest()
     if not hmac.compare_digest(expected, x_hub_signature_256):
         raise HTTPException(401, "invalid webhook signature")
-    # GitHub webhook deliveries are transport signals only. They are not promoted
-    # to approved business events unless a trusted caller submits the full schema.
-    return {"status": "received", "action": "no_event_created"}
+    if len(raw) > 65536:
+        raise HTTPException(413, "webhook payload too large")
+    if not x_github_event:
+        raise HTTPException(422, "missing X-GitHub-Event")
+    try:
+        payload = json.loads(raw)
+        if not isinstance(payload, dict):
+            raise ValueError("webhook JSON must be an object")
+        event = parse_issue_event(
+            payload, x_github_event,
+            os.environ.get("CORPORATE_BRAIN_GITHUB_REPO", ""),
+            {name.strip() for name in os.environ.get("CORPORATE_BRAIN_GITHUB_ACTORS", "").split(",") if name.strip()},
+        )
+        if event is None:
+            return {"status": "ignored", "action": "no_event_created"}
+        # Ingress records a synthetic event, not approval of any real-world action.
+        result = journal.put(event, destinations=("codex", "chatgpt"))
+        return {"status": "accepted", "journal": result}
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(422, str(exc)) from exc
 
