@@ -56,3 +56,36 @@ def test_worker_does_not_ack_unconfirmed_status(tmp_path):
     result = deliver_pending_supabase(db, Unconfirmed())
     assert result["failed"] == 1
     assert len(db.pending("supabase")) == 1
+
+
+def test_github_worker_ack_on_verified_comment(tmp_path):
+    from corporate_brain.sync_worker import deliver_pending_github
+    db = EventJournal(tmp_path / "sync.sqlite3")
+    item = event()
+    item["source_ref"] = "https://github.com/akartashova51180-code/symmetrical-guide/issues/2"
+    db.put(item, destinations=("github",))
+    class Verified:
+        def deliver(self, _):
+            return "delivered"
+    assert deliver_pending_github(db, Verified()) == {
+        "checked": 1, "delivered": 1, "failed": 0
+    }
+    assert db.pending("github") == []
+
+
+def test_github_worker_retries_failed_comment(tmp_path):
+    from corporate_brain.sync_worker import deliver_pending_github
+    from corporate_brain.github_transport import GitHubDeliveryError
+    db = EventJournal(tmp_path / "sync.sqlite3")
+    db.put(event(), destinations=("github",))
+    class Failed:
+        def deliver(self, _):
+            raise GitHubDeliveryError("fake outage")
+    result = deliver_pending_github(db, Failed())
+    assert result["failed"] == 1
+    assert db.pending("github")[0]["attempts"] == 1
+    class Succeeded:
+        def deliver(self, _):
+            return "duplicate"
+    assert deliver_pending_github(db, Succeeded())["delivered"] == 1
+    assert db.pending("github") == []
