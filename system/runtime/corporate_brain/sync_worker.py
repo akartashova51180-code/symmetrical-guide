@@ -7,6 +7,7 @@ from typing import Any
 
 from .sync_core import EventJournal
 from .supabase_transport import SupabaseDeliveryError, from_environment
+from .github_transport import GitHubDeliveryError, from_environment as github_from_environment
 
 
 def deliver_pending_supabase(journal: EventJournal, transport: Any, limit: int = 20) -> dict[str, int]:
@@ -29,6 +30,28 @@ def deliver_pending_supabase(journal: EventJournal, transport: Any, limit: int =
             # Do not expose event bodies or credentials in the journal.
             journal.ack(event["event_id"], event["version"], "supabase", "failed",
                         "Supabase delivery failed; inspect private worker logs")
+            counts["failed"] += 1
+    return counts
+
+
+def deliver_pending_github(journal: EventJournal, transport: Any, limit: int = 20) -> dict[str, int]:
+    """Post verified synthetic gateway receipts and ACK their remote persistence.
+
+    No execution of Codex is triggered or implied by this comment.
+    """
+    counts = {"checked": 0, "delivered": 0, "failed": 0}
+    for item in journal.pending("github", limit):
+        event = item["event"]
+        counts["checked"] += 1
+        try:
+            result = transport.deliver(event)
+            if result not in {"delivered", "duplicate"}:
+                raise GitHubDeliveryError("remote comment was not confirmed")
+            journal.ack(event["event_id"], event["version"], "github", "delivered")
+            counts["delivered"] += 1
+        except (GitHubDeliveryError, ValueError, OSError):
+            journal.ack(event["event_id"], event["version"], "github", "failed",
+                        "GitHub receipt failed; inspect private worker logs")
             counts["failed"] += 1
     return counts
 
