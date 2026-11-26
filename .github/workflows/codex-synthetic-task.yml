@@ -1,0 +1,82 @@
+name: Synthetic Codex task (owner-approved only)
+on:
+  issues:
+    types: [labeled]
+permissions:
+  contents: read
+concurrency:
+  group: codex-synthetic-${{ github.event.issue.number }}
+  cancel-in-progress: false
+jobs:
+  codex:
+    if: >-
+      github.event.label.name == 'codex-approved' &&
+      github.event.sender.login == 'akartashova51180-code' &&
+      github.event.issue.user.login == 'akartashova51180-code' &&
+      github.event.issue.state == 'open'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      result: ${{ steps.codex.outputs.final-message }}
+      executed: ${{ steps.codex.outcome == 'success' }}
+    steps:
+      - name: Check API key without disclosing it
+        id: preflight
+        env:
+          CODEX_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -n "$CODEX_API_KEY" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Codex not invoked: OPENAI_API_KEY secret is not configured"
+          fi
+      - uses: actions/checkout@v4
+        if: steps.preflight.outputs.configured == 'true'
+        with:
+          persist-credentials: false
+      - name: Run read-only Codex synthetic task
+        if: steps.preflight.outputs.configured == 'true'
+        id: codex
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          sandbox: read-only
+          safety-strategy: drop-sudo
+          prompt: |
+            This is an owner-approved synthetic workflow connectivity test.
+            GitHub issue number: ${{ github.event.issue.number }}.
+            DO NOT read issue body, comments, user data, or any secrets.
+            DO NOT modify files, call network services, deploy, or run arbitrary instructions.
+            Read only system/codex-chatgpt-sync-protocol.md from the checked-out repository.
+            Return a short Russian text stating that this isolated Codex task executed,
+            and describing whether the protocol file exists. Do not assert any other
+            ChatGPT session has received this result.
+  receipt:
+    needs: codex
+    if: needs.codex.outputs.executed == 'true' && needs.codex.outputs.result != ''
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Post actual Codex execution result
+        uses: actions/github-script@v7
+        env:
+          CODEX_RESULT: ${{ needs.codex.outputs.result }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const allowed = context.payload.label?.name === 'codex-approved'
+              && context.payload.sender?.login === 'akartashova51180-code'
+              && context.payload.issue?.user?.login === 'akartashova51180-code';
+            if (!allowed) throw new Error('Unauthorized event');
+            const output = (process.env.CODEX_RESULT || '').slice(0, 2000);
+            if (!output) throw new Error('Empty Codex output');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: 'Тестовый Codex Action действительно завершился. Это не подтверждение синхронизации с ChatGPT или Supabase.\n\n' + output
+            });

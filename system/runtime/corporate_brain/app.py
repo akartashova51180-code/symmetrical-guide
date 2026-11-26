@@ -13,6 +13,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from .scheduler import start_scheduler
+from .sync_api import router as sync_router
 from .storage import (REGISTRIES, import_registries, initialize, list_notifications,
                       connect, list_records, list_runs, portfolio_summary, portfolio_overview, update_task, create_task,
                       create_idea, update_idea,
@@ -41,6 +42,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Мозг-администратор · локальное ядро", version="0.1.0", lifespan=lifespan)
+app.include_router(sync_router)
 
 
 class TaskPatch(BaseModel):
