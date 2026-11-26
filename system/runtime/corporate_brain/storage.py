@@ -8,6 +8,13 @@ import sqlite3
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
+
+MOSCOW = ZoneInfo("Europe/Moscow")
+
+
+def moscow_today() -> date:
+    return datetime.now(MOSCOW).date()
 
 REGISTRIES = {
     "projects": "projects.csv",
@@ -142,6 +149,13 @@ def initialize(db_path: Path) -> None:
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS request_idempotency (
+            idempotency_key TEXT PRIMARY KEY,
+            operation TEXT NOT NULL,
+            entity_type TEXT NOT NULL,
+            record_id TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
         """)
     # Additive migration for existing SQLite/PostgreSQL installations.
     if os.environ.get("CORPORATE_BRAIN_DATABASE_URL", "").strip():
@@ -216,7 +230,30 @@ def _registry_fields(source_dir: Path, entity_type: str) -> list[str]:
         return [field.lstrip("\ufeff") for field in (csv.DictReader(stream).fieldnames or [])]
 
 
-def create_music_entry(db_path: Path, source_dir: Path, entity_type: str, fields: dict[str, str]) -> dict[str, Any]:
+def _idempotent_record_id(db, key: str | None, operation: str, entity_type: str) -> str | None:
+    if not key:
+        return None
+    row = db.execute(
+        "SELECT operation, entity_type, record_id FROM request_idempotency WHERE idempotency_key=?",
+        (key,),
+    ).fetchone()
+    if row is None:
+        return None
+    if row["operation"] != operation or row["entity_type"] != entity_type:
+        raise ValueError("Ключ повторного запроса уже использован для другой операции")
+    return row["record_id"]
+
+
+def _save_idempotency_key(db, key: str | None, operation: str, entity_type: str, record_id: str) -> None:
+    if key:
+        db.execute(
+            "INSERT INTO request_idempotency(idempotency_key, operation, entity_type, record_id, created_at) VALUES (?, ?, ?, ?, ?)",
+            (key, operation, entity_type, record_id, datetime.now().astimezone().isoformat(timespec="seconds")),
+        )
+
+
+def create_music_entry(db_path: Path, source_dir: Path, entity_type: str, fields: dict[str, str],
+                       idempotency_key: str | None = None) -> dict[str, Any]:
     if entity_type not in {"music_songs", "song_campaigns", "music_costs"}:
         raise ValueError("Создавать можно только записи музыкальной CRM")
     allowed = set(_registry_fields(source_dir, entity_type))
@@ -235,22 +272,25 @@ def create_music_entry(db_path: Path, source_dir: Path, entity_type: str, fields
     if entity_type == "music_costs" and values.get("song_id") and not get_record(db_path, "music_songs", values["song_id"]):
         raise ValueError("Расход должен ссылаться на существующий song_id или оставаться общим расходом студии")
     with connect(db_path) as db:
-        prefix = {"music_songs": "C", "song_campaigns": "CMP", "music_costs": "MC"}[entity_type]
-        existing_ids = [row[0] for row in db.execute("SELECT record_id FROM records WHERE entity_type=?", (entity_type,))]
-        nums = [int(record_id[len(prefix):]) for record_id in existing_ids
-                if record_id.startswith(prefix) and record_id[len(prefix):].isdigit()]
-        record_id = f"{prefix}{max(nums, default=0)+1:02d}"
-        data = {key: "" for key in allowed}
-        data.update(values)
-        data[key_field] = record_id
-        related = data.get("связанные_проекты") or data.get("project_id") or data.get("проект") or None
-        title = data.get("название") or data.get("цель_кампании") or record_id
-        now = datetime.now().astimezone().isoformat(timespec="seconds")
-        db.execute("""INSERT INTO records(entity_type, record_id, project_id, status, due_date, title, payload_json, source_file, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (entity_type, record_id, related, data.get("статус") or None,
-             _due_date(data.get("плановая_дата", "")), title,
-             json.dumps(data, ensure_ascii=False), REGISTRIES[entity_type], now))
+        record_id = _idempotent_record_id(db, idempotency_key, f"create:{entity_type}", entity_type)
+        if record_id is None:
+            prefix = {"music_songs": "C", "song_campaigns": "CMP", "music_costs": "MC"}[entity_type]
+            existing_ids = [row[0] for row in db.execute("SELECT record_id FROM records WHERE entity_type=?", (entity_type,))]
+            nums = [int(value[len(prefix):]) for value in existing_ids
+                    if value.startswith(prefix) and value[len(prefix):].isdigit()]
+            record_id = f"{prefix}{max(nums, default=0)+1:02d}"
+            data = {key: "" for key in allowed}
+            data.update(values)
+            data[key_field] = record_id
+            related = data.get("связанные_проекты") or data.get("project_id") or data.get("проект") or None
+            title = data.get("название") or data.get("цель_кампании") or record_id
+            now = datetime.now().astimezone().isoformat(timespec="seconds")
+            db.execute("""INSERT INTO records(entity_type, record_id, project_id, status, due_date, title, payload_json, source_file, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (entity_type, record_id, related, data.get("статус") or None,
+                 _due_date(data.get("плановая_дата", "")), title,
+                 json.dumps(data, ensure_ascii=False), REGISTRIES[entity_type], now))
+            _save_idempotency_key(db, idempotency_key, f"create:{entity_type}", entity_type, record_id)
     return get_record(db_path, entity_type, record_id) or {}
 
 
@@ -401,7 +441,8 @@ def update_task(db_path: Path, record_id: str, changes: dict[str, str]) -> dict[
     return item
 
 
-def create_task(db_path: Path, source_dir: Path, fields: dict[str, str]) -> dict[str, Any]:
+def create_task(db_path: Path, source_dir: Path, fields: dict[str, str],
+                idempotency_key: str | None = None) -> dict[str, Any]:
     allowed = set(_registry_fields(source_dir, "tasks"))
     values = {key: str(value).strip() for key, value in fields.items() if key in allowed and key != "id"}
     if not values.get("задача"):
@@ -414,40 +455,47 @@ def create_task(db_path: Path, source_dir: Path, fields: dict[str, str]) -> dict
     if due and _due_date(due) is None:
         raise ValueError("Срок укажите в формате ГГГГ-ММ-ДД или оставьте пустым")
     with connect(db_path) as db:
-        ids = [row[0] for row in db.execute("SELECT record_id FROM records WHERE entity_type='tasks'")]
-        nums = [int(value[1:]) for value in ids if value.startswith("T") and value[1:].isdigit()]
-        record_id = f"T{max(nums, default=0)+1:02d}"
-        data = {key: "" for key in allowed}
-        data.update(values)
-        data["id"] = record_id
-        data["статус"] = data.get("статус") or "К выполнению"
-        data["ответственный"] = data.get("ответственный") or "Анастасия / назначить"
-        now = datetime.now().astimezone().isoformat(timespec="seconds")
-        db.execute("""INSERT INTO records(entity_type, record_id, project_id, status, due_date, title, payload_json, source_file, updated_at)
-            VALUES ('tasks', ?, ?, ?, ?, ?, ?, 'portfolio-api', ?)""",
-            (record_id, data["проект_id"], data["статус"], _due_date(due), data["задача"],
-             json.dumps(data, ensure_ascii=False), now))
+        record_id = _idempotent_record_id(db, idempotency_key, "create:tasks", "tasks")
+        if record_id is None:
+            ids = [row[0] for row in db.execute("SELECT record_id FROM records WHERE entity_type='tasks'")]
+            nums = [int(value[1:]) for value in ids if value.startswith("T") and value[1:].isdigit()]
+            record_id = f"T{max(nums, default=0)+1:02d}"
+            data = {key: "" for key in allowed}
+            data.update(values)
+            data["id"] = record_id
+            data["статус"] = data.get("статус") or "К выполнению"
+            data["ответственный"] = data.get("ответственный") or "Анастасия / назначить"
+            now = datetime.now().astimezone().isoformat(timespec="seconds")
+            db.execute("""INSERT INTO records(entity_type, record_id, project_id, status, due_date, title, payload_json, source_file, updated_at)
+                VALUES ('tasks', ?, ?, ?, ?, ?, ?, 'portfolio-api', ?)""",
+                (record_id, data["проект_id"], data["статус"], _due_date(due), data["задача"],
+                 json.dumps(data, ensure_ascii=False), now))
+            _save_idempotency_key(db, idempotency_key, "create:tasks", "tasks", record_id)
     return get_record(db_path, "tasks", record_id) or {}
 
 
-def create_idea(db_path: Path, source_dir: Path, fields: dict[str, str]) -> dict[str, Any]:
+def create_idea(db_path: Path, source_dir: Path, fields: dict[str, str],
+                idempotency_key: str | None = None) -> dict[str, Any]:
     allowed = set(_registry_fields(source_dir, "ideas"))
     values = {key: str(value).strip() for key, value in fields.items() if key in allowed and key != "id"}
     if not values.get("идея"):
         raise ValueError("Кратко опишите идею, проблему или решение")
     values["статус"] = values.get("статус") or "На классификацию"
-    values["дата"] = values.get("дата") or date.today().isoformat()
+    values["дата"] = values.get("дата") or moscow_today().isoformat()
     values["источник_проект"] = values.get("источник_проект") or "P00"
     with connect(db_path) as db:
-        ids = [row[0] for row in db.execute("SELECT record_id FROM records WHERE entity_type='ideas'")]
-        nums = [int(value[1:]) for value in ids if value.startswith("I") and value[1:].isdigit()]
-        record_id = f"I{max(nums, default=0)+1:02d}"
-        values["id"] = record_id
-        now = datetime.now().astimezone().isoformat(timespec="seconds")
-        related = values.get("предложенный_проект") or values.get("источник_проект") or "P00"
-        db.execute("""INSERT INTO records(entity_type, record_id, project_id, status, title, payload_json, source_file, updated_at)
-            VALUES ('ideas', ?, ?, ?, ?, ?, 'ideas.csv', ?)""",
-            (record_id, related, values["статус"], values["идея"], json.dumps(values, ensure_ascii=False), now))
+        record_id = _idempotent_record_id(db, idempotency_key, "create:ideas", "ideas")
+        if record_id is None:
+            ids = [row[0] for row in db.execute("SELECT record_id FROM records WHERE entity_type='ideas'")]
+            nums = [int(value[1:]) for value in ids if value.startswith("I") and value[1:].isdigit()]
+            record_id = f"I{max(nums, default=0)+1:02d}"
+            values["id"] = record_id
+            now = datetime.now().astimezone().isoformat(timespec="seconds")
+            related = values.get("предложенный_проект") or values.get("источник_проект") or "P00"
+            db.execute("""INSERT INTO records(entity_type, record_id, project_id, status, title, payload_json, source_file, updated_at)
+                VALUES ('ideas', ?, ?, ?, ?, ?, 'ideas.csv', ?)""",
+                (record_id, related, values["статус"], values["идея"], json.dumps(values, ensure_ascii=False), now))
+            _save_idempotency_key(db, idempotency_key, "create:ideas", "ideas", record_id)
     return get_record(db_path, "ideas", record_id) or {}
 
 
@@ -471,7 +519,8 @@ def update_idea(db_path: Path, record_id: str, changes: dict[str, str]) -> dict[
 
 
 def portfolio_summary(db_path: Path, today: date | None = None) -> dict[str, Any]:
-    today = today or date.today()
+    today = today or moscow_today()
+    backend = "Supabase PostgreSQL" if os.environ.get("CORPORATE_BRAIN_DATABASE_URL", "").strip() else "локальная SQLite"
     with connect(db_path) as db:
         counts = {row["entity_type"]: row["n"] for row in db.execute("SELECT entity_type, COUNT(*) n FROM records GROUP BY entity_type")}
         tasks = db.execute("SELECT status, due_date FROM records WHERE entity_type='tasks'").fetchall()
@@ -492,12 +541,12 @@ def portfolio_summary(db_path: Path, today: date | None = None) -> dict[str, Any
         "ideas_waiting_classification": sum((r["status"] or "").casefold() in {"на классификацию", "требует классификации"} for r in ideas),
         "financial_history_status": "нет записей в импортированном реестре" if counts.get("income", 0) == 0 else "записи доступны; суммы требуют проверки качества данных",
         "connected_sources": [],
-        "source_note": "Сводка основана только на локальных CSV; пустой реестр не означает нулевой фактический доход.",
+        "source_note": f"Сводка рассчитана по текущим записям в {backend}; пустой реестр не означает нулевой фактический доход.",
     }
 
 
 def portfolio_overview(db_path: Path, today: date | None = None) -> list[dict[str, Any]]:
-    today = today or date.today()
+    today = today or moscow_today()
     projects = list_records(db_path, "projects")
     tasks = list_records(db_path, "tasks")
     overview = []

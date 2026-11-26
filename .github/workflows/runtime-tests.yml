@@ -1,0 +1,43 @@
+name: Runtime tests
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'system/runtime/**'
+      - '.github/workflows/runtime-tests.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'system/runtime/**'
+      - '.github/workflows/runtime-tests.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: runtime-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python-tests:
+    name: Python runtime tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: system/runtime/uv.lock
+      - name: Install locked dependencies
+        working-directory: system/runtime
+        run: uv sync --locked --extra test
+      - name: Run runtime tests
+        working-directory: system/runtime
+        run: uv run --locked pytest -q
