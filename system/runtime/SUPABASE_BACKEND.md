@@ -21,6 +21,27 @@
 
 `deploy/compose.supabase.yml` запускает API и Telegram-приёмщик, используя внешнюю PostgreSQL-базу Supabase вместо контейнера Postgres. Файл `deploy/.env.supabase.example` содержит только имена переменных и подсказки, без секретных значений. Скопируйте его на сервер как `.env` только после проверки схемы и согласования начального запуска.
 
+## Перенос из тестового Supabase в основной
+
+Для текущей пары проектов добавлен отдельный PostgreSQL → PostgreSQL переносчик `corporate_brain.migrate_postgres_to_postgres`. Он не заменяет SQLite-переносчик. Он принимает только тестовый проект `axtkpwqwyjfseyklsroq` как источник и основной `tdmnqttxmuxxyamsipcq` как цель, требует TLS, подключается к источнику в режиме только чтения, проверяет пустоту цели и совместимость схем, а затем переносит таблицы приложения одной транзакцией с проверкой количества и контрольных сумм строк. Без флага `--apply` выполняется только предварительная проверка; для записи нужны и `--apply`, и явное подтверждение `--confirm-source-stopped`.
+
+Для запуска задайте в защищённом хранилище четыре переменные: `CORPORATE_BRAIN_MIGRATION_SOURCE_URL`, `CORPORATE_BRAIN_MIGRATION_TARGET_URL`, `CORPORATE_BRAIN_MIGRATION_SOURCE_PROJECT_REF=axtkpwqwyjfseyklsroq` и `CORPORATE_BRAIN_MIGRATION_TARGET_PROJECT_REF=tdmnqttxmuxxyamsipcq`. В URL используйте PostgreSQL URI из Supabase Connect с `sslmode=require`; значения URL являются секретами и не должны попадать в Git, переписку или вывод команд. Для файлов CRM переносчик сверяет SHA-256 с файлами в `CORPORATE_BRAIN_DATA_DIR` и останавливается, если вложения отсутствуют или повреждены.
+
+Сначала остановите приложение и Telegram-приёмщик, затем выполните предварительную проверку:
+
+```bash
+cd system/runtime
+uv run --locked python -m corporate_brain.migrate_postgres_to_postgres
+```
+
+Проверьте показанные количества таблиц и вложений. Только после их сверки с тестовым проектом запускайте запись:
+
+```bash
+uv run --locked python -m corporate_brain.migrate_postgres_to_postgres --apply --confirm-source-stopped
+```
+
+Скрипт не очищает цель и прекращает работу, если в ней уже есть данные приложения. При любой ошибке вставки транзакция целевой базы откатывается; тестовый проект не изменяется. После переноса до запуска приложения проверьте сводные количества и доступность медиа. Не запускайте приложение и Telegram-бот одновременно на тестовой и основной базах с одним и тем же ботом.
+
 Для подключения приложению нужен PostgreSQL URI из Supabase Dashboard → **Connect**. URI выбирается для PostgreSQL, а не `anon` или `service_role` API key. Для TLS используйте `sslmode=require`; если сервер не имеет IPv6, обычно подходит Supavisor **Session pooler**. Пароль базы хранится только в закрытом `.env` на сервере или в секрет-хранилище хостинга. Не передавайте URI в чат и не вставляйте его в Git.
 
 Файлы песен остаются в `/srv/anastasia-brain/data/assets`; этот каталог надо сохранять вместе с базой и резервировать. Supabase Storage можно добавить позже, если нужен обмен медиа без постоянного диска приложения; это потребует приватного bucket, правил доступа и отдельного ключа, поэтому сейчас он не подключён.

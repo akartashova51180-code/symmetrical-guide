@@ -1,6 +1,13 @@
 import csv
+import hashlib
 import json
+import os
 from datetime import date
+from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
+from uuid import uuid4
+
+import pytest
 
 from corporate_brain.storage import import_registries, initialize, list_records, portfolio_summary, update_task, portfolio_overview, create_task
 from corporate_brain.scheduler import run_morning_cycle
@@ -31,6 +38,99 @@ def test_import_preserves_all_fields_and_summary_does_not_infer_zero_income(tmp_
     assert summary["tasks_overdue"] == 1
     assert summary["income_records"] == 0
     assert "нет записей" in summary["financial_history_status"]
+
+
+def test_postgres_transfer_requires_expected_supabase_project_and_tls():
+    from corporate_brain.migrate_postgres_to_postgres import (
+        SOURCE_PROJECT_REF,
+        TARGET_PROJECT_REF,
+        _validate_project_url,
+    )
+
+    source = f"postgresql://postgres.{SOURCE_PROJECT_REF}@aws-0-eu-west-3.pooler.supabase.com:5432/postgres?sslmode=require"
+    target = f"postgresql://postgres@db.{TARGET_PROJECT_REF}.supabase.co:5432/postgres?sslmode=verify-full"
+    _validate_project_url(source, SOURCE_PROJECT_REF, "источника")
+    _validate_project_url(target, TARGET_PROJECT_REF, "цели")
+
+    with pytest.raises(RuntimeError, match="не подтверждает"):
+        _validate_project_url(source, TARGET_PROJECT_REF, "цели")
+    with pytest.raises(RuntimeError, match="SSL"):
+        _validate_project_url(target.replace("sslmode=verify-full", "sslmode=prefer"), TARGET_PROJECT_REF, "цели")
+
+
+def test_postgres_transfer_apply_requires_stopped_source(tmp_path):
+    from corporate_brain.migrate_postgres_to_postgres import migrate
+
+    with pytest.raises(RuntimeError, match="остановите приложение"):
+        migrate(apply=True, source_stopped=False, data_dir=tmp_path)
+
+
+def test_postgres_to_postgres_migration_against_temporary_databases(tmp_path, monkeypatch):
+    admin_url = os.environ.get("CORPORATE_BRAIN_MIGRATION_TEST_URL")
+    if not admin_url:
+        pytest.skip("CI PostgreSQL service is not configured")
+
+    import psycopg
+    from psycopg import sql
+    import corporate_brain.migrate_postgres_to_postgres as migration
+
+    suffix = uuid4().hex[:10]
+    source_db = f"migration_source_{suffix}"
+    target_db = f"migration_target_{suffix}"
+    parsed = urlsplit(admin_url)
+    source_url = urlunsplit((parsed.scheme, parsed.netloc, f"/{source_db}", parsed.query, parsed.fragment))
+    target_url = urlunsplit((parsed.scheme, parsed.netloc, f"/{target_db}", parsed.query, parsed.fragment))
+
+    with psycopg.connect(admin_url, autocommit=True) as admin:
+        admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(source_db)))
+        admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(target_db)))
+
+    try:
+        monkeypatch.setenv("CORPORATE_BRAIN_MIGRATION_SOURCE_PROJECT_REF", migration.SOURCE_PROJECT_REF)
+        monkeypatch.setenv("CORPORATE_BRAIN_MIGRATION_TARGET_PROJECT_REF", migration.TARGET_PROJECT_REF)
+        monkeypatch.setenv("CORPORATE_BRAIN_MIGRATION_SOURCE_URL", source_url)
+        monkeypatch.setenv("CORPORATE_BRAIN_MIGRATION_TARGET_URL", target_url)
+        monkeypatch.setattr(migration, "_validate_project_url", lambda *_: None)
+
+        from corporate_brain.storage import initialize
+        monkeypatch.setenv("CORPORATE_BRAIN_DATABASE_URL", source_url)
+        initialize(tmp_path / "ignored-source.sqlite3")
+        media_root = tmp_path / "data"
+        asset_path = media_root / "assets" / "sample.wav"
+        asset_path.parent.mkdir(parents=True)
+        asset_content = b"test audio fixture"
+        asset_path.write_bytes(asset_content)
+        asset_hash = hashlib.sha256(asset_content).hexdigest()
+
+        with psycopg.connect(source_url) as source:
+            source.execute("INSERT INTO records(entity_type, record_id, title, payload_json, updated_at) VALUES ('projects','P01','fixture','{}','2026-11-26T12:00:00+00:00')")
+            source.execute("INSERT INTO notifications(event_key, kind, created_at, payload_json, seen) VALUES ('event-1','daily_brief','2026-11-26T12:00:00+00:00','{}',0)")
+            source.execute("INSERT INTO job_runs(job_name, started_at, status, details_json) VALUES ('fixture','2026-11-26T12:00:00+00:00','ok','{}')")
+            source.execute("INSERT INTO song_assets(song_id, kind, original_name, stored_path, media_type, size_bytes, sha256, uploaded_at) VALUES ('C01','audio_master','sample.wav','assets/sample.wav','audio/wav',%s,%s,'2026-11-26T12:00:00+00:00')", (len(asset_content), asset_hash))
+            source.execute("INSERT INTO telegram_intake_state(chat_id, updated_at) VALUES ('42','2026-11-26T12:00:00+00:00')")
+            source.execute("ALTER TABLE telegram_intake_state DROP COLUMN pending_action")
+            source.execute("INSERT INTO telegram_bot_runtime(key, value) VALUES ('offset','5')")
+            source.execute("INSERT INTO request_idempotency(idempotency_key, operation, entity_type, record_id, created_at) VALUES ('k1','create:ideas','ideas','I01','2026-11-26T12:00:00+00:00')")
+            source.execute("INSERT INTO telegram_notification_outbox(event_key) VALUES ('event-1')")
+
+        plan = migration.migrate(apply=False, source_stopped=False, data_dir=media_root)
+        assert plan["records"] == 1 and plan["verified_assets"] == 1
+        with psycopg.connect(target_url) as target:
+            assert target.execute("SELECT to_regclass('public.records')").fetchone()[0] is None
+
+        copied = migration.migrate(apply=True, source_stopped=True, data_dir=media_root)
+        assert copied["records"] == 1 and copied["notifications"] == 1
+        with psycopg.connect(target_url) as target:
+            assert target.execute("SELECT COUNT(*) FROM records").fetchone()[0] == 1
+            assert target.execute("SELECT pending_action FROM telegram_intake_state WHERE chat_id='42'").fetchone()[0] == ""
+            assert target.execute("SELECT COUNT(*) FROM telegram_notification_outbox").fetchone()[0] == 1
+
+        with pytest.raises(RuntimeError, match="уже содержит записи"):
+            migration.migrate(apply=True, source_stopped=True, data_dir=media_root)
+    finally:
+        with psycopg.connect(admin_url, autocommit=True) as admin:
+            admin.execute(sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(source_db)))
+            admin.execute(sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(target_db)))
 
 
 def test_daily_cycle_is_idempotent_and_does_not_send_external_messages(tmp_path):
