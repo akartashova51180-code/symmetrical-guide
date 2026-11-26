@@ -212,11 +212,78 @@ def test_idea_inbox_api_accepts_and_routes_owner_discussion(tmp_path, monkeypatc
     monkeypatch.setattr(app_module,"DATA_DIR",dbdir)
     monkeypatch.setattr(app_module,"SOURCE_DIR",source)
     with TestClient(app_module.app) as client:
-        created=client.post("/api/ideas",json={"fields":{"идея":"Написать статью","источник_проект":"P03","источник_чат_GPT":"GPT контента"}})
+        payload={"fields":{"идея":"Написать статью","источник_проект":"P03","источник_чат_GPT":"GPT контента"}}
+        created=client.post("/api/ideas",json=payload,headers={"Idempotency-Key":"telegram-update-100"})
         assert created.status_code==200 and created.json()["record_id"]=="I01"
+        retried=client.post("/api/ideas",json=payload,headers={"Idempotency-Key":"telegram-update-100"})
+        assert retried.status_code==200 and retried.json()["record_id"]=="I01"
+        assert len(client.get("/api/ideas").json())==1
         routed=client.patch("/api/ideas/I01",json={"fields":{"статус":"Передано в проект","маршрутизация":"content_editor; market","влияние_на_проекты":"P03"}})
         assert routed.status_code==200
         assert client.get("/api/ideas").json()[0]["data"]["маршрутизация"]=="content_editor; market"
+
+
+def test_health_reports_backend_and_database_failure(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    from corporate_brain import app as app_module
+    db = tmp_path / "portfolio.sqlite3"
+    monkeypatch.setattr(app_module, "DB_PATH", db)
+    monkeypatch.delenv("CORPORATE_BRAIN_DATABASE_URL", raising=False)
+    with TestClient(app_module.app) as client:
+        healthy = client.get("/healthz")
+        assert healthy.status_code == 200
+        assert healthy.json()["mode"] == "sqlite" and healthy.json()["database"] == "ok"
+
+        def unavailable(_):
+            raise OSError("private connection detail")
+        monkeypatch.setattr(app_module, "connect", unavailable)
+        failed = client.get("/healthz")
+        assert failed.status_code == 503
+        assert failed.json()["detail"] == "database unavailable"
+        assert "private connection detail" not in failed.text
+
+
+def test_telegram_update_is_retried_without_advancing_offset(tmp_path):
+    from corporate_brain.storage import get_telegram_offset, get_telegram_state, initialize, update_telegram_state
+    from corporate_brain.telegram_intake import IntakeBot
+
+    update = {"update_id": 77, "message": {"chat": {"id": 42, "type": "private"},
+              "from": {"id": 42}, "text": "проверить резервную копию"}}
+
+    class FakeTelegram:
+        def __init__(self): self.messages=[]
+        def call(self, method, payload, timeout=35):
+            assert method == "getUpdates"
+            return [update]
+        def send_message(self, chat_id, text): self.messages.append(text)
+
+    class FlakyCRM:
+        def __init__(self): self.keys=[]; self.failed=True
+        def create_idea(self, text, idempotency_key=None):
+            self.keys.append(idempotency_key)
+            if self.failed:
+                self.failed=False
+                raise RuntimeError("temporary database outage")
+            return {"record_id":"I01"}
+
+    db=tmp_path/"db.sqlite3";initialize(db)
+    update_telegram_state(db, "42", pending_action="new_idea")
+    telegram=FakeTelegram();crm=FlakyCRM()
+    bot=IntakeBot(db,telegram,crm,{"42"})
+    try:
+        bot.poll_once()
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("temporary CRM failure must leave the Telegram update unacknowledged")
+    assert get_telegram_offset(db)==0
+    assert get_telegram_state(db, "42")["pending_action"] == "new_idea"
+    assert "повторит обработку автоматически" in telegram.messages[0]
+
+    assert bot.poll_once()==1
+    assert get_telegram_offset(db)==78
+    assert get_telegram_state(db, "42")["pending_action"] == ""
+    assert crm.keys==["telegram-update-77","telegram-update-77"]
 
 
 def test_telegram_intake_routes_owner_export_to_one_shared_song(tmp_path):
@@ -232,7 +299,7 @@ def test_telegram_intake_routes_owner_export_to_one_shared_song(tmp_path):
     class FakeCRM:
         def __init__(self): self.song=None; self.assets=[]
         def request(self, path): return [{"record_id":"P09"},{"record_id":"P10"}]
-        def create_song(self, fields):
+        def create_song(self, fields, idempotency_key=None):
             self.song={"record_id":"C77","data":fields}; return self.song
         def patch_song(self, song_id, fields): self.song["data"].update(fields); return self.song
         def upload_asset(self, song_id, filename, kind, content, content_type):
@@ -300,11 +367,11 @@ def test_telegram_brain_menu_captures_ideas_tasks_and_summary(tmp_path):
             if path=="/api/tasks" and method=="POST":
                 self.created_tasks.append(payload);return {"record_id":"T77"}
             raise AssertionError(path)
-        def create_idea(self,text):
+        def create_idea(self,text,idempotency_key=None):
             return self.request("/api/ideas",{"fields":{"идея":text}},"POST")
-        def create_task(self,project_id,title,due_date="",role="secretary"):
+        def create_task(self,project_id,title,due_date="",role="secretary",idempotency_key=None):
             return self.request("/api/tasks",{"project_id":project_id,"title":title,"due_date":due_date,"role":role},"POST")
-        def create_song(self,fields): return {"record_id":"C77","data":fields}
+        def create_song(self,fields,idempotency_key=None): return {"record_id":"C77","data":fields}
         def patch_song(self,*_): return {}
         def upload_asset(self,*_): return {"size_bytes":10}
 

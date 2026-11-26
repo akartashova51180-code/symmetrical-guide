@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
@@ -86,7 +86,13 @@ def dashboard() -> FileResponse:
 
 @app.get("/healthz")
 def health() -> dict[str, str]:
-    return {"status": "ok", "mode": "local-only", "timezone": "Europe/Moscow"}
+    try:
+        with connect(DB_PATH) as db:
+            db.execute("SELECT 1").fetchone()
+    except Exception:
+        raise HTTPException(status_code=503, detail="database unavailable") from None
+    mode = "postgresql" if os.environ.get("CORPORATE_BRAIN_DATABASE_URL", "").strip() else "sqlite"
+    return {"status": "ok", "mode": mode, "database": "ok", "timezone": "Europe/Moscow"}
 
 
 @app.get("/api/summary")
@@ -105,9 +111,9 @@ def ideas(limit: int = 200) -> list[dict[str, Any]]:
 
 
 @app.post("/api/ideas")
-def add_idea(body: IdeaBody) -> dict[str, Any]:
+def add_idea(body: IdeaBody, idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> dict[str, Any]:
     try:
-        return create_idea(DB_PATH, SOURCE_DIR, body.fields)
+        return create_idea(DB_PATH, SOURCE_DIR, body.fields, idempotency_key=idempotency_key)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
 
@@ -139,11 +145,12 @@ def music_costs(limit: int = 500) -> list[dict[str, Any]]:
 
 
 @app.post("/api/music/{entity_type}")
-def create_music_record(entity_type: str, body: MusicEntryBody) -> dict[str, Any]:
+def create_music_record(entity_type: str, body: MusicEntryBody,
+                        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> dict[str, Any]:
     if entity_type not in {"music_songs", "song_campaigns", "music_costs"}:
         raise HTTPException(404, "Неизвестный реестр музыкальной CRM")
     try:
-        return create_music_entry(DB_PATH, SOURCE_DIR, entity_type, body.fields)
+        return create_music_entry(DB_PATH, SOURCE_DIR, entity_type, body.fields, idempotency_key=idempotency_key)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
 
@@ -261,11 +268,11 @@ def patch_task(record_id: str, patch: TaskPatch) -> dict[str, Any]:
 
 
 @app.post("/api/tasks")
-def add_task(task: TaskCreate) -> dict[str, Any]:
+def add_task(task: TaskCreate, idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> dict[str, Any]:
     fields = {"проект_id": task.project_id, "задача": task.title, "следующий_шаг": task.next_step,
               "срок": task.due_date, "ответственный": task.responsible, "роль": task.role}
     try:
-        return create_task(DB_PATH, SOURCE_DIR, fields)
+        return create_task(DB_PATH, SOURCE_DIR, fields, idempotency_key=idempotency_key)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
 

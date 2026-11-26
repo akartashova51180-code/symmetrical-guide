@@ -15,6 +15,10 @@ from typing import Any
 
 from .storage import get_telegram_offset, get_telegram_state, set_telegram_offset, update_telegram_state
 
+
+class PermanentUpdateError(RuntimeError):
+    """The request was rejected and will not succeed if the same update is retried."""
+
 MAX_TELEGRAM_FILE_BYTES = 20 * 1024 * 1024
 BOT_COMMANDS = [
     {"command": "start", "description": "Открыть меню"},
@@ -101,26 +105,39 @@ class CRMClient:
     def __init__(self, base_url: str = "http://127.0.0.1:8787") -> None:
         self.base_url = base_url.rstrip("/")
 
-    def request(self, path: str, payload: dict[str, Any] | None = None, method: str = "GET") -> Any:
+    def request(self, path: str, payload: dict[str, Any] | None = None, method: str = "GET",
+                idempotency_key: str | None = None) -> Any:
         body = json.dumps(payload).encode() if payload is not None else None
         headers = {"Content-Type": "application/json"} if body is not None else {}
+        if idempotency_key:
+            headers["Idempotency-Key"] = idempotency_key
         req = urllib.request.Request(self.base_url + path, data=body, headers=headers, method=method)
         try:
             with urllib.request.urlopen(req, timeout=15) as response:
                 return json.loads(response.read())
+        except urllib.error.HTTPError as exc:
+            if 400 <= exc.code < 500:
+                try:
+                    error_body = json.loads(exc.read())
+                    detail = error_body.get("detail") or "Проверьте введённые данные"
+                except Exception:
+                    detail = "Проверьте введённые данные"
+                raise PermanentUpdateError(str(detail)) from None
+            raise RuntimeError(f"Локальная CRM временно недоступна (HTTP {exc.code})") from None
         except Exception as exc:
-            raise RuntimeError(f"Локальная CRM недоступна ({type(exc).__name__}); запустите основной сервис") from None
+            raise RuntimeError(f"Локальная CRM временно недоступна ({type(exc).__name__})") from None
 
-    def create_song(self, fields: dict[str, str]) -> dict[str, Any]:
-        return self.request("/api/music/music_songs", {"fields": fields}, "POST")
+    def create_song(self, fields: dict[str, str], idempotency_key: str | None = None) -> dict[str, Any]:
+        return self.request("/api/music/music_songs", {"fields": fields}, "POST", idempotency_key)
 
-    def create_idea(self, text: str) -> dict[str, Any]:
+    def create_idea(self, text: str, idempotency_key: str | None = None) -> dict[str, Any]:
         return self.request("/api/ideas", {"fields": {"идея": text, "тип": "Идея из Telegram",
-                           "источник_чат_GPT": "Telegram-приёмщик", "источник_проект": "P00"}}, "POST")
+                           "источник_чат_GPT": "Telegram-приёмщик", "источник_проект": "P00"}}, "POST", idempotency_key)
 
-    def create_task(self, project_id: str, title: str, due_date: str = "", role: str = "secretary") -> dict[str, Any]:
+    def create_task(self, project_id: str, title: str, due_date: str = "", role: str = "secretary",
+                    idempotency_key: str | None = None) -> dict[str, Any]:
         return self.request("/api/tasks", {"project_id": project_id, "title": title,
-                           "due_date": due_date, "role": role}, "POST")
+                           "due_date": due_date, "role": role}, "POST", idempotency_key)
 
     def summary(self) -> dict[str, Any]:
         return self.request("/api/summary")
@@ -174,6 +191,8 @@ class IntakeProcessor:
             pass
 
     def process(self, update: dict[str, Any]) -> None:
+        update_id = update.get("update_id")
+        idempotency_key = f"telegram-update-{update_id}" if isinstance(update_id, int) and update_id >= 0 else None
         message = update.get("message") or {}
         chat = message.get("chat") or {}
         sender = message.get("from") or {}
@@ -208,13 +227,15 @@ class IntakeProcessor:
             state = get_telegram_state(self.db_path, chat_id)
         if state["pending_action"] and text and not text.startswith("/"):
             pending_action = state["pending_action"]
-            update_telegram_state(self.db_path, chat_id, pending_action="")
             if pending_action == "new_song":
                 text = "/new " + text
             elif pending_action == "new_idea":
-                idea = self.crm.create_idea(text)
+                idea = self.crm.create_idea(text, idempotency_key=idempotency_key)
+                update_telegram_state(self.db_path, chat_id, pending_action="")
                 self._reply(chat_id, f"Идея сохранена во входящий поток: {idea['record_id']}. Она ожидает классификации и решения владелицы.")
                 return
+            else:
+                update_telegram_state(self.db_path, chat_id, pending_action="")
         if text.startswith("/start") or text.startswith("/help"):
             self._reply_with_menu(chat_id, "Корпоративный приёмщик. Через меню доступны сводка, проекты, задачи, входящий поток идей и общая CRM песен. Команды: /summary, /projects, /tasks, /idea, /task P02 | текст | YYYY-MM-DD, /songs, /new, /source Имя, /projects P09;P10, /link URL, /text текст, /done. Идеи из Telegram только записываются во входящий поток: их классифицирует и направляет владелица/мозг-администратор.")
             return
@@ -267,7 +288,7 @@ class IntakeProcessor:
                 update_telegram_state(self.db_path, chat_id, pending_action="new_idea")
                 self._reply(chat_id, "Напишите идею одним сообщением. Я сохраню её во входящем потоке для последующей классификации; ничего не опубликую и не назначу автоматически. /cancel отменяет ввод.")
                 return
-            idea = self.crm.create_idea(idea_text)
+            idea = self.crm.create_idea(idea_text, idempotency_key=idempotency_key)
             self._reply(chat_id, f"Идея сохранена во входящий поток: {idea['record_id']}. Она ожидает классификации и решения владелицы.")
             return
         if text.startswith("/task "):
@@ -280,7 +301,7 @@ class IntakeProcessor:
             if not re.fullmatch(r"P\d{2}", project_id):
                 self._reply(chat_id, "Первым укажите ID проекта, например P02.")
                 return
-            task = self.crm.create_task(project_id, title, due_date)
+            task = self.crm.create_task(project_id, title, due_date, idempotency_key=idempotency_key)
             self._reply(chat_id, f"Задача записана: {task['record_id']} · {project_id}. Проверьте назначение и срок в общей системе.")
             return
         if text == "/cancel":
@@ -297,7 +318,7 @@ class IntakeProcessor:
                       "площадка_создания": state["source_name"], "ссылка_на_проект_площадки": state["source_link"],
                       "статус_сведений": "Черновой паспорт через Telegram-приёмщик; проверить детали",
                       "материал_в_этой_среде": "Ожидает загрузки файла"}
-            song = self.crm.create_song(fields)
+            song = self.crm.create_song(fields, idempotency_key=idempotency_key)
             song_id = song["record_id"]
             update_telegram_state(self.db_path, chat_id, active_song_id=song_id, pending_action="")
             self._reply(chat_id, f"Создана карточка {song_id}. Отправьте сюда аудио/текст; файлы до 20 МБ будут добавлены в общий каталог.")
@@ -361,26 +382,42 @@ class IntakeBot:
         self.db_path = db_path
         self.telegram = telegram
         self.processor = IntakeProcessor(db_path, telegram, crm, allowed_user_ids)
+        self._last_notified_update_id: int | None = None
 
     def poll_once(self) -> int:
         offset = get_telegram_offset(self.db_path)
         updates = self.telegram.call("getUpdates", {"offset": offset, "timeout": 20, "allowed_updates": ["message"]}, timeout=35)
         processed = 0
         for update in updates:
+            update_id = int(update["update_id"])
             try:
                 self.processor.process(update)
-            except Exception as exc:
-                print(f"Telegram update failed ({type(exc).__name__}); update will be acknowledged", file=sys.stderr)
+            except PermanentUpdateError as exc:
                 message = update.get("message") or {}
                 chat = message.get("chat") or {}
                 sender = message.get("from") or {}
                 chat_id = str(chat.get("id", ""))
                 if chat.get("type") == "private" and str(sender.get("id", "")) in self.processor.allowed_user_ids:
+                    update_telegram_state(self.db_path, chat_id, pending_action="")
                     try:
-                        self.telegram.send_message(chat_id, "Не получилось завершить действие. Проверьте введённые данные и попробуйте ещё раз; запись могла сохраниться частично, проверьте её в общей CRM.")
+                        self.telegram.send_message(chat_id, f"Не удалось выполнить действие: {exc}. Исправьте данные и отправьте команду заново.")
                     except Exception:
                         pass
-            set_telegram_offset(self.db_path, int(update["update_id"]) + 1)
+            except Exception as exc:
+                print(f"Telegram update failed ({type(exc).__name__}); it will be retried", file=sys.stderr)
+                message = update.get("message") or {}
+                chat = message.get("chat") or {}
+                sender = message.get("from") or {}
+                chat_id = str(chat.get("id", ""))
+                if (update_id != self._last_notified_update_id and chat.get("type") == "private"
+                        and str(sender.get("id", "")) in self.processor.allowed_user_ids):
+                    try:
+                        self.telegram.send_message(chat_id, "Временная ошибка при сохранении. Бот повторит обработку автоматически; пока не отправляйте это действие повторно.")
+                        self._last_notified_update_id = update_id
+                    except Exception:
+                        pass
+                raise
+            set_telegram_offset(self.db_path, update_id + 1)
             processed += 1
         return processed
 
