@@ -25,20 +25,31 @@
 
 Для текущей пары проектов добавлен отдельный PostgreSQL → PostgreSQL переносчик `corporate_brain.migrate_postgres_to_postgres`. Он не заменяет SQLite-переносчик. Он принимает только тестовый проект `axtkpwqwyjfseyklsroq` как источник и основной `tdmnqttxmuxxyamsipcq` как цель, требует TLS, подключается к источнику в режиме только чтения, проверяет пустоту цели и совместимость схем, а затем переносит таблицы приложения одной транзакцией с проверкой количества и контрольных сумм строк. Без флага `--apply` выполняется только предварительная проверка; для записи нужны и `--apply`, и явное подтверждение `--confirm-source-stopped`.
 
-Для запуска задайте в защищённом хранилище четыре переменные: `CORPORATE_BRAIN_MIGRATION_SOURCE_URL`, `CORPORATE_BRAIN_MIGRATION_TARGET_URL`, `CORPORATE_BRAIN_MIGRATION_SOURCE_PROJECT_REF=axtkpwqwyjfseyklsroq` и `CORPORATE_BRAIN_MIGRATION_TARGET_PROJECT_REF=tdmnqttxmuxxyamsipcq`. В URL используйте PostgreSQL URI из Supabase Connect с `sslmode=require`; значения URL являются секретами и не должны попадать в Git, переписку или вывод команд. Для файлов CRM переносчик сверяет SHA-256 с файлами в `CORPORATE_BRAIN_DATA_DIR` и останавливается, если вложения отсутствуют или повреждены.
+Перенос запускается на компьютере или сервере с прямым PostgreSQL TCP-доступом к обоим Supabase Session Pooler. Текущая Codex Cloud-среда может обращаться к разрешённым HTTP-адресам, но не может разрешить адреса PostgreSQL; раздел «Секреты HTTP» не заменяет TCP-подключение. Поэтому не задавайте URI баз в Codex Cloud для этого переноса.
 
-Сначала остановите приложение и Telegram-приёмщик, затем выполните предварительную проверку:
+Для локального запуска на Windows используйте `corporate_brain.migrate_supabase_interactive`. Он отдельно и без отображения спросит пароль тестовой и основной базы, соберёт URI в памяти и сначала выполнит только проверку. Пароли и URI не записываются в файлы и не передаются в командной строке. Из каталога `system/runtime` выполните:
+
+```powershell
+uv sync --locked
+uv run --locked python -m corporate_brain.migrate_supabase_interactive
+```
+
+В качестве альтернативы на VPS с прямым доступом к Supabase задайте в закрытом `.env` переменные `CORPORATE_BRAIN_MIGRATION_SOURCE_URL`, `CORPORATE_BRAIN_MIGRATION_TARGET_URL`, `CORPORATE_BRAIN_MIGRATION_SOURCE_PROJECT_REF=axtkpwqwyjfseyklsroq` и `CORPORATE_BRAIN_MIGRATION_TARGET_PROJECT_REF=tdmnqttxmuxxyamsipcq`. Защитите файл правами `600`; не добавляйте его в Git и не включайте в незашифрованные копии. Для файлов CRM переносчик сверяет SHA-256 с файлами в `CORPORATE_BRAIN_DATA_DIR` и останавливается, если вложения отсутствуют или повреждены.
+
+На Windows предварительная проверка запускается интерактивной командой выше. На VPS выполните её из `system/runtime`; она ничего не записывает и не требует остановки приложения:
 
 ```bash
 cd system/runtime
 uv run --locked python -m corporate_brain.migrate_postgres_to_postgres
 ```
 
-Проверьте показанные количества таблиц и вложений. Только после их сверки с тестовым проектом запускайте запись:
+Проверьте показанные количества таблиц и вложений. Перед записью остановите приложение и Telegram-приёмщик, сверьте количество данных и убедитесь, что основная база должна принять эти данные. На VPS запустите:
 
 ```bash
 uv run --locked python -m corporate_brain.migrate_postgres_to_postgres --apply --confirm-source-stopped
 ```
+
+Для Windows используйте ту же интерактивную команду с флагами `--apply --confirm-source-stopped`.
 
 Скрипт не очищает цель и прекращает работу, если в ней уже есть данные приложения. При любой ошибке вставки транзакция целевой базы откатывается; тестовый проект не изменяется. После переноса до запуска приложения проверьте сводные количества и доступность медиа. Не запускайте приложение и Telegram-бот одновременно на тестовой и основной базах с одним и тем же ботом.
 
