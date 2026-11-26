@@ -1,0 +1,2 @@
+signal_id,date,channel,location,segment,request_type,buyer_direct_or_intermediary,verified_brief,decision_maker,proposed_service,client_price_agreed,payment_received,source_link_or_private_ref,quality_status,next_step
+SAMPLE-NOT-DATA,,,,,,,,,,,,,,Удалить строку-пример при первом фактическом сигнале
