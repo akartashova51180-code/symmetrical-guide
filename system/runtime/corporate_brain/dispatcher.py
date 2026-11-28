@@ -207,7 +207,9 @@ def _reserve_and_claim(conn, settings: dict):
                                 settings["model"], settings["max_output"])
         reserved = estimate_reservation(payload, settings)
         if settings["backend"] == "managed":
-            reserved = max(reserved, Decimal("0.01"))
+            # Reserve the ENTIRE requested session cap, not a 1-cent estimate.
+            # Otherwise multiple managed sessions could exceed the daily cap.
+            reserved = settings["per_run"]
         today = dt.datetime.now(dt.timezone.utc).date()
         spent = conn.execute("""
             SELECT COALESCE(SUM(GREATEST(reserved_usd,COALESCE(actual_usd,0))),0)
@@ -257,7 +259,7 @@ def _execute_one(conn, settings: dict) -> bool:
         max_cents = int((settings["per_run"] * 100).to_integral_value(rounding="ROUND_FLOOR"))
         try:
             session = managed_agent.create_session(
-                payload["input"], agent_id=agent_id, cents=max(1,min(30,max_cents)))
+                payload["input"], agent_id=agent_id, cents=max_cents)
         except Exception:
             _mark_uncertain(conn, assignment_id, "managed_submission")
             raise RuntimeError("Managed session creation uncertain; do not retry") from None
@@ -436,6 +438,8 @@ def main() -> int:
         raise RuntimeError("Unrecognized backend")
     if settings["backend"] == "managed" and not os.environ.get("BRAIN_AGENT_ID", ""):
         raise RuntimeError("Saved Platform agent ID required")
+    if settings["backend"] == "managed" and not (Decimal("0.01") <= settings["per_run"] <= Decimal("0.30") and (settings["per_run"] * 100) % 1 == 0):
+        raise RuntimeError("Managed agent requires a whole-cent per-run limit between $0.01 and $0.30")
     if not 1 <= settings["max_running"] <= 2 or not 128 <= settings["max_output"] <= 4096:
         raise RuntimeError("Unsafe concurrency/output configuration")
     with psycopg.connect(os.environ["CORPORATE_BRAIN_DATABASE_URL"]) as conn:
