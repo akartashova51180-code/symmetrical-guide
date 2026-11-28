@@ -1,0 +1,31 @@
+name: Dispatcher offline verification
+
+on:
+  pull_request:
+    paths:
+      - "system/runtime/corporate_brain/dispatcher.py"
+      - "system/runtime/corporate_brain/managed_agent.py"
+      - "system/runtime/tests/test_dispatcher.py"
+      - "system/runtime/tests/test_managed_agent.py"
+      - ".github/workflows/dispatcher-offline.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: system/runtime
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.9.11"
+      - name: Check syntax (no secrets, no external APIs)
+        run: uv run --locked --extra test python -m compileall -q corporate_brain/dispatcher.py corporate_brain/managed_agent.py
+      - name: Execute offline tests only
+        run: uv run --locked --extra test pytest -q tests/test_dispatcher.py tests/test_managed_agent.py

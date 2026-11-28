@@ -1,0 +1,28 @@
+[Unit]
+Description=Kartashova Brain - controlled AI dispatcher (opt-in)
+After=network-online.target
+Wants=network-online.target
+# Install ONLY after review and spending approval.
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/kartashova/symmetrical-guide/system/runtime
+EnvironmentFile=/opt/kartashova/symmetrical-guide/system/runtime/deploy/.env
+EnvironmentFile=/etc/kartashova/openai.env
+EnvironmentFile=/etc/kartashova/dispatcher.env
+ExecStart=/opt/kartashova/symmetrical-guide/system/runtime/.venv/bin/python -m corporate_brain.dispatcher --once
+TimeoutStartSec=180
+MemoryMax=400M
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+UMask=0077
+# Existing root-owned secrets require a dedicated worker/permissions review.
+# Do not enable as root in production: set User=brain-worker once access to
+# /etc/kartashova/*.env and deploy/.env is configured and verified.
