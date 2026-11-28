@@ -50,6 +50,8 @@ REVIEW_INSTRUCTIONS = (
     "Проверяй соответствие заданию, неподтверждённые факты, "
     "ненужные расходы, риски репутации и времени собственника. "
     "Не ставь статус 'принято' без доказательств. "
+    "Первая строка строго: ВЕРДИКТ: ПРИНЯТЬ, ВЕРДИКТ: ДОРАБОТАТЬ или "
+    "ВЕРДИКТ: НЕДОСТАТОЧНО ДАННЫХ. "
     "Верни конкретный вердикт ПРИНЯТЬ / ДОРАБОТАТЬ / НЕДОСТАТОЧНО ДАННЫХ."
 )
 API_URL = "https://api.openai.com/v1/responses"
@@ -131,8 +133,29 @@ def _make_payload(role: str, task: str, model: str, max_output: int, *, review: 
     }
 
 
+def route_role(instruction: str) -> str:
+    """Conservative free routing: unclassified instructions go to HQ."""
+    low = instruction.lower()
+    keywords = (
+        ("hr", ("ваканси", "кандидат", "подбор персонал", "резюме", "рекрут")),
+        ("marketing", ("целевая аудитори", "спрос", "вордстат", "маркетинг")),
+        ("sales", ("продаж", "клиент", "воронк", "коммерческ")),
+        ("finance", ("бюджет", "себестоим", "прибыл", "финанс")),
+        ("content", ("стать", "пост ", "контент", "публикац")),
+        ("product", ("мини-продукт", "прототип", "продукт", "сервис")),
+        ("security", ("корпоративн", "безопасност", "угроз")),
+        ("music", ("песн", "музык", "гимн", "трек")),
+    )
+    for role, markers in keywords:
+        if any(marker in low for marker in markers):
+            return role
+    return "00"
+
+
 def queue_task(conn, project_id: str, role_code: str, instruction: str, source_key: str) -> str:
     """Explicit, idempotent local enqueue. Does not invoke a paid API."""
+    if role_code == "auto":
+        role_code = route_role(instruction)
     if role_code not in ROLES or role_code == "audit":
         raise ValueError("Unknown executor role")
     if not project_id.strip() or not source_key.strip():
@@ -305,7 +328,7 @@ def _review_one(conn, settings: dict) -> bool:
             UPDATE brain_ops.assignments SET review_response_id=%s,review=%s,
              status=%s,error_code=%s,updated_at=now() WHERE id=%s AND status='running'
         """,(rid or None,text or None,
-             ("completed" if "ПРИНЯТЬ" in text[:120] and "ДОРАБОТАТЬ" not in text[:120] else "rejected") if valid else "blocked",
+             ("completed" if text.splitlines()[0].strip() == "ВЕРДИКТ: ПРИНЯТЬ" else "rejected") if valid else "blocked",
              None if valid else "incomplete_review",aid))
     return True
 
