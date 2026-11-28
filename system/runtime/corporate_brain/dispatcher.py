@@ -89,6 +89,7 @@ def _settings() -> dict:
         "max_output": int(os.environ.get("BRAIN_MAX_OUTPUT_TOKENS", "1200")),
         "max_running": int(os.environ.get("BRAIN_MAX_RUNNING", "1")),
         "backend": os.environ.get("BRAIN_EXECUTION_BACKEND", "responses"),
+        "max_tasks": int(os.environ.get("BRAIN_MAX_TOTAL_TASKS", "1")),
     }
 
 
@@ -187,6 +188,11 @@ def _reserve_and_claim(conn, settings: dict):
     """Serialize budget checking and reservation across worker processes."""
     with conn.transaction():
         conn.execute("SELECT pg_advisory_xact_lock(6003, 1)")
+        count = conn.execute("""
+            SELECT COUNT(*) FROM brain_ops.budget_ledger WHERE purpose='execute'
+        """).fetchone()[0]
+        if count >= settings["max_tasks"]:
+            return None
         active = conn.execute("""
             SELECT COUNT(*) FROM brain_ops.assignments WHERE status='running'
         """).fetchone()[0]
@@ -434,6 +440,10 @@ def main() -> int:
     if not args.once:
         parser.error("Use --enqueue or --once; automatic looping is intentionally not enabled")
     settings = _settings()
+    if settings["max_tasks"] != 1:
+        raise RuntimeError("Pilot is authorized for ONE task only; higher volume requires new approval")
+    if settings["daily"] > Decimal("0.30"):
+        raise RuntimeError("Approved pilot daily ceiling is $0.30")
     if settings["backend"] not in ("responses", "managed"):
         raise RuntimeError("Unrecognized backend")
     if settings["backend"] == "managed" and not os.environ.get("BRAIN_AGENT_ID", ""):
