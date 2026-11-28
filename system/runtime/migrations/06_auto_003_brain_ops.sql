@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS brain_ops.assignments (
   source_key text NOT NULL UNIQUE,
   status text NOT NULL DEFAULT 'queued' CHECK (status IN
     ('queued','running','awaiting_review','completed','rejected','blocked')),
-  response_id text,
+  backend text NOT NULL DEFAULT 'responses' CHECK (backend IN ('responses','managed')),\n  response_id text,
   result text,
   review text,
   review_response_id text,
