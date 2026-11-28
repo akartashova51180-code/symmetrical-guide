@@ -1,0 +1,13 @@
+[Unit]
+Description=Periodically process one approved Kartashova Brain assignment
+# Do not enable until dispatcher cost budget is approved and E2E checked.
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=2min
+AccuracySec=30s
+Unit=kartashova-dispatcher.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target
