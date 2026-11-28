@@ -21,6 +21,8 @@ import uuid
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
+from . import managed_agent
+
 import psycopg
 
 ROLES = {
@@ -82,6 +84,7 @@ def _settings() -> dict:
         "output_rate": _usd("BRAIN_OUTPUT_USD_PER_MILLION"),
         "max_output": int(os.environ.get("BRAIN_MAX_OUTPUT_TOKENS", "1200")),
         "max_running": int(os.environ.get("BRAIN_MAX_RUNNING", "1")),
+        "backend": os.environ.get("BRAIN_EXECUTION_BACKEND", "responses"),
     }
 
 
@@ -198,6 +201,8 @@ def _reserve_and_claim(conn, settings: dict):
         payload = _make_payload(role, "Проект: " + project_id + "\nПоручение: " + task,
                                 settings["model"], settings["max_output"])
         reserved = estimate_reservation(payload, settings)
+        if settings["backend"] == "managed":
+            reserved = max(reserved, Decimal("0.01"))
         today = dt.datetime.now(dt.timezone.utc).date()
         spent = conn.execute("""
             SELECT COALESCE(SUM(GREATEST(reserved_usd,COALESCE(actual_usd,0))),0)
@@ -212,9 +217,9 @@ def _reserve_and_claim(conn, settings: dict):
         """, (assignment_id, today, reserved))
         conn.execute("""
             UPDATE brain_ops.assignments
-            SET status='running',attempts=attempts+1,started_at=now(),updated_at=now()
+            SET status='running',backend=%s,attempts=attempts+1,started_at=now(),updated_at=now()
             WHERE id=%s
-        """, (assignment_id,))
+        """, (settings["backend"],assignment_id))
         return str(assignment_id), payload
 
 
@@ -242,6 +247,29 @@ def _execute_one(conn, settings: dict) -> bool:
     if claimed is None:
         return False
     assignment_id, payload = claimed
+    if settings["backend"] == "managed":
+        agent_id = os.environ.get("BRAIN_AGENT_ID", "")
+        max_cents = int((settings["per_run"] * 100).to_integral_value(rounding="ROUND_FLOOR"))
+        try:
+            session = managed_agent.create_session(
+                payload["input"], agent_id=agent_id, cents=max(1,min(30,max_cents)))
+        except Exception:
+            _mark_uncertain(conn, assignment_id, "managed_submission")
+            raise RuntimeError("Managed session creation uncertain; do not retry") from None
+        sid = session.get("id")
+        if not isinstance(sid, str) or not sid:
+            _mark_uncertain(conn, assignment_id, "managed_id_missing")
+            raise RuntimeError("Managed session ID missing; manual reconciliation") from None
+        with conn.transaction():
+            conn.execute("""
+                UPDATE brain_ops.assignments SET response_id=%s,updated_at=now()
+                WHERE id=%s AND status='running'
+            """,(sid,assignment_id))
+            conn.execute("""
+                UPDATE brain_ops.budget_ledger SET response_id=%s
+                WHERE assignment_id=%s AND purpose='execute'
+            """,(sid,assignment_id))
+        return True
     try:
         response = _remote(payload)
     except Exception:
@@ -263,6 +291,53 @@ def _execute_one(conn, settings: dict) -> bool:
         """, (response_id or None, text or None,
               "awaiting_review" if valid else "blocked",
               None if valid else "incomplete_response", assignment_id))
+    return True
+
+
+def _resume_managed(conn, settings: dict) -> bool:
+    """Reconcile one saved session, never re-submit the original paid task."""
+    row = conn.execute("""
+        SELECT id,response_id FROM brain_ops.assignments
+        WHERE backend='managed' AND status='running'
+          AND response_id IS NOT NULL AND result IS NULL
+        ORDER BY started_at LIMIT 1
+    """).fetchone()
+    if row is None:
+        return False
+    aid,sid = row
+    try:
+        state = managed_agent.session_status(sid)
+    except Exception:
+        # Read error: leave running, try status read again later (not a paid retry).
+        return False
+    status = state.get("status")
+    if status in ("failed", "budget_reached", "requires_action"):
+        with conn.transaction():
+            conn.execute("""
+                UPDATE brain_ops.assignments SET status='blocked',error_code=%s,updated_at=now()
+                WHERE id=%s AND status='running'
+            """,("managed_"+status,aid))
+        return True
+    if status != "idle":
+        return False
+    try:
+        text = managed_agent.session_final_text(sid)
+    except Exception:
+        return False
+    if not text:
+        return False
+    usage = state.get("usage")
+    # Model-specific pricing must be configured, and returned usage is provisional.
+    cost = _usage_cost({"usage": usage}, settings) if usage else None
+    with conn.transaction():
+        conn.execute("""
+            UPDATE brain_ops.assignments SET result=%s,status='awaiting_review',updated_at=now()
+            WHERE id=%s AND status='running' AND result IS NULL
+        """,(text,aid))
+        conn.execute("""
+            UPDATE brain_ops.budget_ledger SET actual_usd=%s
+            WHERE assignment_id=%s AND purpose='execute'
+        """,(cost,aid))
     return True
 
 
@@ -352,12 +427,17 @@ def main() -> int:
     if not args.once:
         parser.error("Use --enqueue or --once; automatic looping is intentionally not enabled")
     settings = _settings()
+    if settings["backend"] not in ("responses", "managed"):
+        raise RuntimeError("Unrecognized backend")
+    if settings["backend"] == "managed" and not os.environ.get("BRAIN_AGENT_ID", ""):
+        raise RuntimeError("Saved Platform agent ID required")
     if not 1 <= settings["max_running"] <= 2 or not 128 <= settings["max_output"] <= 4096:
         raise RuntimeError("Unsafe concurrency/output configuration")
     with psycopg.connect(os.environ["CORPORATE_BRAIN_DATABASE_URL"]) as conn:
+        resumed = _resume_managed(conn,settings) if settings["backend"] == "managed" else False
         execution = _execute_one(conn,settings)
         review = _review_one(conn,settings)
-    print(json.dumps({"executed":execution,"reviewed":review},ensure_ascii=False))
+    print(json.dumps({"executed":execution,"reconciled":resumed,"reviewed":review},ensure_ascii=False))
     return 0
 
 
